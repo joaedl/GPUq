@@ -1,0 +1,14 @@
+[Unit]
+Description=GPU job scheduler daemon (gpuqd)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/gpuqd
+Restart=on-failure
+RestartSec=2
+# Give the currently running job a moment to clean up before SIGKILL.
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

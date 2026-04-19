@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""gpuq — submit, list, or cancel jobs on the GPU scheduler.
+
+Usage:
+  gpuq submit [--priority N] [--label NAME] -- <cmd> [args...]
+  gpuq run    [--priority N] [--label NAME] -- <cmd> [args...]   # alias
+  gpuq status
+  gpuq cancel <id>
+
+`submit`/`run` blocks until the job finishes, streams stdout/stderr, and
+exits with the job's exit code. If you interrupt the client (Ctrl-C or
+parent death), the daemon cancels the job.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import sys
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get(
+    "GPUQ_DIR",
+    os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")) + "/gpu-scheduler",
+))
+SOCK_PATH = STATE_DIR / "sock"
+
+
+def connect() -> socket.socket:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(str(SOCK_PATH))
+    except (FileNotFoundError, ConnectionRefusedError) as e:
+        print(f"gpuq: daemon not reachable at {SOCK_PATH}: {e}", file=sys.stderr)
+        print("      start it with:  systemctl --user start gpuqd", file=sys.stderr)
+        sys.exit(2)
+    return s
+
+
+# Env vars worth forwarding to the job. CUDA_* in particular affect GPU visibility.
+ENV_PASSTHROUGH_PREFIXES = ("CUDA_", "NVIDIA_", "HF_", "HUGGINGFACE_", "TORCH_",
+                            "XLA_", "JAX_", "TF_", "PYTORCH_")
+ENV_PASSTHROUGH_EXACT = {"PATH", "HOME", "USER", "LANG", "LC_ALL", "LD_LIBRARY_PATH",
+                         "VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV"}
+
+
+def collect_env() -> dict[str, str]:
+    out = {}
+    for k, v in os.environ.items():
+        if k in ENV_PASSTHROUGH_EXACT or k.startswith(ENV_PASSTHROUGH_PREFIXES):
+            out[k] = v
+    return out
+
+
+def cmd_submit(args: argparse.Namespace) -> int:
+    if not args.cmd:
+        print("gpuq: no command given (use -- before the command)", file=sys.stderr)
+        return 2
+
+    s = connect()
+    req = {
+        "op": "submit",
+        "cmd": args.cmd,
+        "cwd": os.getcwd(),
+        "env": collect_env(),
+        "priority": args.priority,
+        "label": args.label,
+    }
+    s.sendall((json.dumps(req) + "\n").encode())
+    f = s.makefile("rb")
+    exit_code = 1
+    for line in f:
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        t = msg.get("type")
+        if t == "queued" and not args.quiet:
+            print(f"gpuq: queued as #{msg['id']} (priority {msg['priority']})",
+                  file=sys.stderr)
+        elif t == "started" and not args.quiet:
+            print(f"gpuq: #{msg['id']} running", file=sys.stderr)
+        elif t == "stdout":
+            sys.stdout.write(msg.get("data", ""))
+            sys.stdout.flush()
+        elif t == "stderr":
+            sys.stderr.write(msg.get("data", ""))
+            sys.stderr.flush()
+        elif t == "exit":
+            code = msg.get("code")
+            exit_code = code if isinstance(code, int) else 1
+            if msg.get("canceled") and not args.quiet:
+                print(f"gpuq: #{msg['id']} canceled", file=sys.stderr)
+            break
+        elif t == "error":
+            print(f"gpuq: {msg.get('error')}", file=sys.stderr)
+            return 2
+    return exit_code
+
+
+def cmd_status(_args: argparse.Namespace) -> int:
+    s = connect()
+    s.sendall(b'{"op":"status"}\n')
+    line = s.makefile("rb").readline()
+    if not line:
+        print("gpuq: empty response from daemon", file=sys.stderr)
+        return 1
+    resp = json.loads(line)
+    cur = resp.get("current")
+    if cur:
+        print(f"running: #{cur['id']}  p={cur['priority']}  {cur['label']}")
+    else:
+        print("running: (idle)")
+    q = resp.get("queue") or []
+    if not q:
+        print("queue:   (empty)")
+        return 0
+    print(f"queue:   {len(q)} waiting")
+    for j in q:
+        age = j["age_seconds"]
+        age_str = f"{age:.0f}s" if age < 120 else f"{age/60:.1f}m"
+        print(f"  #{j['id']}  p={j['priority']} (eff {j['effective_priority']:.2f})  "
+              f"age {age_str}  {j['label']}")
+    return 0
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    s = connect()
+    s.sendall((json.dumps({"op": "cancel", "id": args.id}) + "\n").encode())
+    resp = json.loads(s.makefile("rb").readline() or "{}")
+    if resp.get("canceled"):
+        print(f"gpuq: canceled #{args.id}")
+        return 0
+    print(f"gpuq: no such job: #{args.id}", file=sys.stderr)
+    return 1
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="gpuq", description="GPU job scheduler client")
+    sp = p.add_subparsers(dest="subcmd", required=True)
+
+    for name in ("submit", "run"):
+        sub = sp.add_parser(name, help="submit a job and block until it finishes")
+        sub.add_argument("--priority", "-p", type=int, default=5,
+                         help="higher runs first (default 5)")
+        sub.add_argument("--label", "-l", help="short name shown in status")
+        sub.add_argument("-q", "--quiet", action="store_true",
+                         help="suppress queued/running notices on stderr")
+        sub.add_argument("cmd", nargs=argparse.REMAINDER,
+                         help="command and args (put after --)")
+        sub.set_defaults(func=cmd_submit)
+
+    st = sp.add_parser("status", help="show queue and running job")
+    st.set_defaults(func=cmd_status)
+
+    ca = sp.add_parser("cancel", help="cancel a queued or running job")
+    ca.add_argument("id", type=int)
+    ca.set_defaults(func=cmd_cancel)
+
+    args = p.parse_args()
+    # Strip a leading '--' from REMAINDER if present.
+    if getattr(args, "cmd", None) and args.cmd and args.cmd[0] == "--":
+        args.cmd = args.cmd[1:]
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
