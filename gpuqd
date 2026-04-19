@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """GPU job scheduler daemon.
 
-Accepts jobs over a Unix socket, runs them one at a time, ordered by
-priority (higher first) with age-based fairness. Streams stdout/stderr
-back to each client until the job exits.
+Accepts jobs over a Unix socket and runs them across N GPU slots (one job
+per slot), ordered by priority with age-based fairness. Streams stdout/stderr
+back to each attached client until the job exits.
+
+Queue state is persisted under STATE_DIR/jobs/<id>/meta.json so queued jobs
+survive daemon restarts and reboots. A running job whose daemon dies is
+reaped on restart (we can't waitpid() a non-child, so we terminate if still
+alive and mark it crashed). Resumed queued jobs have no live client, so
+their output is written to per-job stdout.log / stderr.log files that
+`gpuq logs <id>` can show.
 """
 from __future__ import annotations
 
@@ -11,6 +18,7 @@ import heapq
 import json
 import os
 import selectors
+import shutil
 import signal
 import socket
 import subprocess
@@ -25,6 +33,8 @@ STATE_DIR = Path(os.environ.get(
 ))
 SOCK_PATH = STATE_DIR / "sock"
 LOG_PATH = STATE_DIR / "daemon.log"
+JOBS_DIR = STATE_DIR / "jobs"
+SEQ_PATH = STATE_DIR / "seq"
 
 _log_lock = threading.Lock()
 
@@ -42,27 +52,95 @@ def log(msg: str) -> None:
             pass
 
 
-class Job:
-    _seq = 0
-    _seq_lock = threading.Lock()
+def detect_gpus() -> int:
+    """Decide how many GPU slots to run. GPUQ_GPUS wins; else nvidia-smi -L; else 1."""
+    env = os.environ.get("GPUQ_GPUS")
+    if env:
+        try:
+            n = int(env)
+            if n >= 1:
+                return n
+        except ValueError:
+            log(f"ignoring invalid GPUQ_GPUS={env!r}")
+    smi = shutil.which("nvidia-smi")
+    if smi:
+        try:
+            out = subprocess.run([smi, "-L"], capture_output=True, text=True, timeout=5)
+            n = sum(1 for ln in out.stdout.splitlines() if ln.strip().startswith("GPU "))
+            if n >= 1:
+                return n
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return 1
 
-    def __init__(self, cmd, cwd, env, priority, label, conn):
-        with Job._seq_lock:
-            Job._seq += 1
-            self.id = Job._seq
+
+def atomic_write(path: Path, data: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+class JobSeq:
+    """Persistent monotonic job id counter."""
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        try:
+            self.n = int(SEQ_PATH.read_text().strip())
+        except (OSError, ValueError):
+            self.n = 0
+        # Also ensure we're above any existing job directories, in case
+        # SEQ_PATH was lost but jobs/ still exists.
+        if JOBS_DIR.is_dir():
+            for d in JOBS_DIR.iterdir():
+                try:
+                    self.n = max(self.n, int(d.name))
+                except ValueError:
+                    pass
+
+    def next(self) -> int:
+        with self.lock:
+            self.n += 1
+            atomic_write(SEQ_PATH, str(self.n))
+            return self.n
+
+
+class Job:
+    def __init__(self, jid: int, cmd, cwd, env, priority, label, submitted_at,
+                 conn: socket.socket | None = None):
+        self.id = jid
         self.cmd: list[str] = cmd
         self.cwd: str | None = cwd
         self.env: dict[str, str] = env or {}
         self.priority: int = priority
         self.label: str = label or " ".join(cmd[:3])
-        self.conn: socket.socket = conn
-        self.submitted_at: float = time.time()
+        self.submitted_at: float = submitted_at
         self.started_at: float | None = None
         self.finished_at: float | None = None
         self.exit_code: int | None = None
         self.proc: subprocess.Popen | None = None
         self.canceled: bool = False
+        self.gpu_slot: int | None = None
+        self.conn: socket.socket | None = conn
         self.send_lock = threading.Lock()
+
+    @property
+    def dir(self) -> Path:
+        return JOBS_DIR / str(self.id)
 
     def effective_priority(self) -> float:
         # heapq is a min-heap, so we negate: lower sort key = runs first.
@@ -70,6 +148,8 @@ class Job:
         return -(self.priority + age_minutes / 10.0)
 
     def send(self, msg: dict) -> None:
+        if self.conn is None:
+            return
         data = (json.dumps(msg) + "\n").encode()
         with self.send_lock:
             try:
@@ -77,56 +157,159 @@ class Job:
             except (BrokenPipeError, OSError, ConnectionResetError):
                 pass
 
+    def to_meta(self, status: str) -> dict:
+        return {
+            "id": self.id,
+            "cmd": self.cmd,
+            "cwd": self.cwd,
+            "env": self.env,
+            "priority": self.priority,
+            "label": self.label,
+            "submitted_at": self.submitted_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "exit_code": self.exit_code,
+            "canceled": self.canceled,
+            "gpu_slot": self.gpu_slot,
+            "status": status,
+            "pid": self.proc.pid if self.proc else None,
+        }
+
+    @classmethod
+    def from_meta(cls, m: dict) -> "Job":
+        j = cls(
+            jid=m["id"],
+            cmd=m["cmd"],
+            cwd=m.get("cwd"),
+            env=m.get("env") or {},
+            priority=int(m.get("priority", 5)),
+            label=m.get("label"),
+            submitted_at=float(m.get("submitted_at") or time.time()),
+            conn=None,
+        )
+        j.started_at = m.get("started_at")
+        j.finished_at = m.get("finished_at")
+        j.exit_code = m.get("exit_code")
+        j.canceled = bool(m.get("canceled", False))
+        j.gpu_slot = m.get("gpu_slot")
+        return j
+
+    def persist(self, status: str) -> None:
+        self.dir.mkdir(parents=True, exist_ok=True)
+        atomic_write(self.dir / "meta.json", json.dumps(self.to_meta(status), indent=2))
+
+    def erase(self) -> None:
+        try:
+            shutil.rmtree(self.dir)
+        except FileNotFoundError:
+            pass
+
 
 class Scheduler:
-    def __init__(self) -> None:
-        self.queue: list = []  # heap of (effective_priority, seq, Job)
+    def __init__(self, n_gpus: int) -> None:
+        self.n_gpus = n_gpus
+        self.queue: list = []  # heap of (effective_priority, id, Job)
+        self.running: dict[int, Job] = {}  # slot -> Job
         self.lock = threading.Lock()
         self.cv = threading.Condition(self.lock)
-        self.current: Job | None = None
         self.stopping = False
+        self.seq = JobSeq()
 
+    # --- restore from disk ----------------------------------------------------
+    def restore(self) -> None:
+        """Called at startup. Re-queue persisted jobs. Reap stale running ones."""
+        if not JOBS_DIR.is_dir():
+            return
+        resumed_q = 0
+        reaped = 0
+        for d in sorted(JOBS_DIR.iterdir(), key=lambda p: int(p.name) if p.name.isdigit() else 0):
+            meta_path = d / "meta.json"
+            if not meta_path.exists():
+                continue
+            try:
+                m = json.loads(meta_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            status = m.get("status")
+            if status == "queued":
+                job = Job.from_meta(m)
+                heapq.heappush(self.queue, (job.effective_priority(), job.id, job))
+                resumed_q += 1
+            elif status == "running":
+                # The daemon died while this job was running. We can't re-adopt
+                # a non-child process. If its pid is still around, SIGTERM it;
+                # then mark the job as crashed.
+                pid = m.get("pid")
+                if pid and pid_alive(pid):
+                    try:
+                        os.killpg(pid, signal.SIGTERM)
+                    except (OSError, ProcessLookupError):
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                        except OSError:
+                            pass
+                job = Job.from_meta(m)
+                job.finished_at = time.time()
+                if job.exit_code is None:
+                    job.exit_code = 137  # SIGKILL-ish: killed by daemon crash
+                job.persist("crashed")
+                reaped += 1
+            # status in {"done", "canceled", "crashed"}: leave as-is.
+        if resumed_q or reaped:
+            log(f"restored queue: {resumed_q} requeued, {reaped} reaped")
+
+    # --- queue ops ------------------------------------------------------------
     def submit(self, job: Job) -> None:
         with self.cv:
+            job.persist("queued")
             heapq.heappush(self.queue, (job.effective_priority(), job.id, job))
             self.cv.notify()
 
     def cancel_id(self, job_id: int) -> bool:
         with self.cv:
-            if self.current and self.current.id == job_id:
-                self.current.canceled = True
-                proc = self.current.proc
-                if proc and proc.poll() is None:
-                    try:
-                        # start_new_session=True put proc in its own pgrp, so
-                        # SIGTERM on the group reaches children (e.g. sleep
-                        # inside a bash -c), not just the immediate child.
-                        os.killpg(proc.pid, signal.SIGTERM)
-                    except (OSError, ProcessLookupError):
+            for slot, job in self.running.items():
+                if job.id == job_id:
+                    job.canceled = True
+                    proc = job.proc
+                    if proc and proc.poll() is None:
                         try:
-                            proc.terminate()
-                        except OSError:
-                            pass
-                return True
+                            os.killpg(proc.pid, signal.SIGTERM)
+                        except (OSError, ProcessLookupError):
+                            try:
+                                proc.terminate()
+                            except OSError:
+                                pass
+                    return True
             new_q = [(p, i, j) for (p, i, j) in self.queue if j.id != job_id]
             if len(new_q) == len(self.queue):
                 return False
+            canceled = next(j for (_, _, j) in self.queue if j.id == job_id)
             self.queue = new_q
             heapq.heapify(self.queue)
-            self.cv.notify()
-            # Tell the canceled job's client and close it.
-            for (_, _, j) in self.queue:
+            canceled.canceled = True
+            canceled.exit_code = 130
+            canceled.finished_at = time.time()
+            canceled.persist("canceled")
+            canceled.send({"type": "exit", "code": 130, "id": canceled.id, "canceled": True})
+            try:
+                if canceled.conn:
+                    canceled.conn.shutdown(socket.SHUT_RDWR)
+                    canceled.conn.close()
+            except OSError:
                 pass
+            self.cv.notify_all()
             return True
 
     def snapshot(self) -> dict:
         with self.lock:
-            cur = self._summary(self.current) if self.current else None
+            running = []
+            for slot in sorted(self.running):
+                running.append({**self._summary(self.running[slot]), "gpu_slot": slot})
             q = sorted(
                 (self._summary(j) for (_, _, j) in self.queue),
                 key=lambda x: -x["effective_priority"],
             )
-            return {"current": cur, "queue": q}
+            return {"n_gpus": self.n_gpus, "running": running, "queue": q}
 
     @staticmethod
     def _summary(j: Job) -> dict:
@@ -140,9 +323,11 @@ class Scheduler:
             "submitted_at": j.submitted_at,
             "started_at": j.started_at,
             "age_seconds": round(time.time() - j.submitted_at, 1),
+            "detached": j.conn is None,
         }
 
-    def worker(self) -> None:
+    # --- worker loop ----------------------------------------------------------
+    def worker(self, slot: int) -> None:
         while True:
             with self.cv:
                 while not self.queue and not self.stopping:
@@ -153,37 +338,57 @@ class Scheduler:
                 self.queue = [(j.effective_priority(), j.id, j) for (_, _, j) in self.queue]
                 heapq.heapify(self.queue)
                 _, _, job = heapq.heappop(self.queue)
-                self.current = job
-            self._run(job)
-            with self.lock:
-                self.current = None
+                job.gpu_slot = slot
+                self.running[slot] = job
+            self._run(slot, job)
+            with self.cv:
+                self.running.pop(slot, None)
+                self.cv.notify_all()  # wake other workers (queue may have items)
 
-    def _run(self, job: Job) -> None:
+    def _run(self, slot: int, job: Job) -> None:
         job.started_at = time.time()
-        job.send({"type": "started", "id": job.id})
+        job.send({"type": "started", "id": job.id, "gpu_slot": slot})
+
+        # Always write to log files (so a later daemon crash, or `gpuq logs`,
+        # still has the output). If a client is attached we also stream.
+        job.dir.mkdir(parents=True, exist_ok=True)
+        stdout_log = (job.dir / "stdout.log").open("ab")
+        stderr_log = (job.dir / "stderr.log").open("ab")
+
+        # Build child env: scheduler-assigned slot wins over anything the user
+        # sent — that's the whole point of the scheduler.
+        child_env = {**os.environ, **job.env, "CUDA_VISIBLE_DEVICES": str(slot),
+                     "GPUQ_GPU_SLOT": str(slot)}
+
         try:
             proc = subprocess.Popen(
                 job.cmd,
                 cwd=job.cwd or None,
-                env={**os.environ, **job.env},
+                env=child_env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
             )
             job.proc = proc
+            job.persist("running")
 
-            def pump(stream, tag):
+            def pump(stream, tag, file_sink):
                 try:
                     while True:
                         chunk = stream.read(4096)
                         if not chunk:
                             return
+                        try:
+                            file_sink.write(chunk)
+                            file_sink.flush()
+                        except OSError:
+                            pass
                         job.send({"type": tag, "data": chunk.decode("utf-8", errors="replace")})
                 except (OSError, ValueError):
                     pass
 
-            t_out = threading.Thread(target=pump, args=(proc.stdout, "stdout"), daemon=True)
-            t_err = threading.Thread(target=pump, args=(proc.stderr, "stderr"), daemon=True)
+            t_out = threading.Thread(target=pump, args=(proc.stdout, "stdout", stdout_log), daemon=True)
+            t_err = threading.Thread(target=pump, args=(proc.stderr, "stderr", stderr_log), daemon=True)
             t_out.start()
             t_err.start()
             proc.wait()
@@ -196,6 +401,10 @@ class Scheduler:
         except FileNotFoundError as e:
             job.exit_code = 127
             job.send({"type": "stderr", "data": f"gpuqd: {e}\n"})
+            try:
+                stderr_log.write(f"gpuqd: {e}\n".encode())
+            except OSError:
+                pass
         except Exception as e:  # noqa: BLE001
             log(f"job {job.id} crashed: {e}")
             job.exit_code = 1
@@ -203,23 +412,24 @@ class Scheduler:
         finally:
             job.finished_at = time.time()
             if job.canceled:
-                # Normalise: cancellation always reports 130 so clients can
-                # distinguish it from the job's own exit status (which for
-                # SIGTERM-killed bash would be platform-dependent).
                 job.exit_code = 130
             elif job.exit_code is None:
                 job.exit_code = 1
             job.send({"type": "exit", "code": job.exit_code, "id": job.id,
                       "canceled": job.canceled})
             try:
-                job.conn.shutdown(socket.SHUT_RDWR)
+                stdout_log.close()
+                stderr_log.close()
             except OSError:
                 pass
+            job.persist("canceled" if job.canceled else "done")
             try:
-                job.conn.close()
+                if job.conn:
+                    job.conn.shutdown(socket.SHUT_RDWR)
+                    job.conn.close()
             except OSError:
                 pass
-            log(f"job {job.id} done: exit={job.exit_code} canceled={job.canceled} "
+            log(f"job {job.id} done: slot={slot} exit={job.exit_code} canceled={job.canceled} "
                 f"runtime={job.finished_at - (job.started_at or job.finished_at):.1f}s "
                 f"cmd={job.cmd}")
 
@@ -240,11 +450,13 @@ def handle_client(conn: socket.socket, sched: Scheduler) -> None:
                 conn.sendall(b'{"type":"error","error":"cmd must be a non-empty list"}\n')
                 return
             job = Job(
+                jid=sched.seq.next(),
                 cmd=cmd,
                 cwd=req.get("cwd"),
                 env=req.get("env") or {},
                 priority=int(req.get("priority", 5)),
                 label=req.get("label"),
+                submitted_at=time.time(),
                 conn=conn,
             )
             sched.submit(job)
@@ -255,18 +467,24 @@ def handle_client(conn: socket.socket, sched: Scheduler) -> None:
             sel = selectors.DefaultSelector()
             sel.register(conn, selectors.EVENT_READ)
             while job.exit_code is None:
-                for _ in sel.select(timeout=0.5):
-                    try:
-                        peek = conn.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
-                    except BlockingIOError:
-                        peek = b"\0"
-                    except OSError:
-                        peek = b""
-                    if not peek:
-                        # Client disconnected: cancel the job.
-                        log(f"client for job {job.id} disconnected, canceling")
-                        sched.cancel_id(job.id)
+                ready = sel.select(timeout=0.5)
+                if not ready:
+                    continue
+                try:
+                    peek = conn.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+                except BlockingIOError:
+                    peek = b"\0"
+                except OSError:
+                    peek = b""
+                if not peek:
+                    # Empty peek = FIN from client OR the daemon itself has
+                    # closed the conn because the job finished. Distinguish:
+                    # if exit_code is set, the job is done, exit cleanly.
+                    if job.exit_code is not None:
                         return
+                    log(f"client for job {job.id} disconnected, canceling")
+                    sched.cancel_id(job.id)
+                    return
             return  # job completed; _run already closed conn
 
         if op == "status":
@@ -277,6 +495,32 @@ def handle_client(conn: socket.socket, sched: Scheduler) -> None:
             job_id = int(req.get("id"))
             ok = sched.cancel_id(job_id)
             conn.sendall((json.dumps({"canceled": ok, "id": job_id}) + "\n").encode())
+            return
+
+        if op == "logs":
+            job_id = int(req.get("id"))
+            job_dir = JOBS_DIR / str(job_id)
+            if not job_dir.is_dir():
+                conn.sendall((json.dumps({"type": "error", "error": f"no such job: #{job_id}"}) + "\n").encode())
+                return
+            meta_path = job_dir / "meta.json"
+            meta = {}
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    pass
+            out = (job_dir / "stdout.log").read_bytes() if (job_dir / "stdout.log").exists() else b""
+            err = (job_dir / "stderr.log").read_bytes() if (job_dir / "stderr.log").exists() else b""
+            payload = {
+                "type": "logs",
+                "id": job_id,
+                "status": meta.get("status"),
+                "exit_code": meta.get("exit_code"),
+                "stdout": out.decode("utf-8", errors="replace"),
+                "stderr": err.decode("utf-8", errors="replace"),
+            }
+            conn.sendall((json.dumps(payload) + "\n").encode())
             return
 
         conn.sendall((json.dumps({"type": "error", "error": f"unknown op: {op}"}) + "\n").encode())
@@ -291,6 +535,7 @@ def handle_client(conn: socket.socket, sched: Scheduler) -> None:
 
 def main() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
     # If an old socket file lingers but nobody's listening, remove it.
     if SOCK_PATH.exists():
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -304,8 +549,12 @@ def main() -> None:
         finally:
             probe.close()
 
-    sched = Scheduler()
-    threading.Thread(target=sched.worker, daemon=True).start()
+    n_gpus = detect_gpus()
+    sched = Scheduler(n_gpus=n_gpus)
+    sched.restore()
+    for slot in range(n_gpus):
+        threading.Thread(target=sched.worker, args=(slot,), daemon=True).start()
+    log(f"started with {n_gpus} GPU slot(s)")
 
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(str(SOCK_PATH))
@@ -317,17 +566,21 @@ def main() -> None:
         log(f"signal {signum}, shutting down")
         sched.stopping = True
         with sched.cv:
-            if sched.current and sched.current.proc:
-                try:
-                    sched.current.proc.terminate()
-                except OSError:
-                    pass
+            for job in list(sched.running.values()):
+                if job.proc:
+                    try:
+                        os.killpg(job.proc.pid, signal.SIGTERM)
+                    except (OSError, ProcessLookupError):
+                        try:
+                            job.proc.terminate()
+                        except OSError:
+                            pass
             sched.cv.notify_all()
         try:
             srv.close()
         except OSError:
             pass
-        # Give the running job a chance to wind down briefly, then exit.
+        # Give running jobs a brief window to wind down.
         time.sleep(0.2)
         sys.exit(0)
 

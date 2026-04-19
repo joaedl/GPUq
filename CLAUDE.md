@@ -1,8 +1,11 @@
 # GPU scheduler (gpuq)
 
-This machine has one GPU. A host-wide scheduler (`gpuqd`) serialises GPU work so
-parallel Claude Code sessions don't collide. **Run any command that uses GPU
-compute through `gpuq submit` instead of invoking it directly.**
+A host-wide scheduler (`gpuqd`) manages access to the GPUs on this machine so
+parallel Claude Code sessions don't collide. It runs up to one job per GPU at
+a time and assigns `CUDA_VISIBLE_DEVICES` to pin each job to its slot.
+**Run any command that uses GPU compute through `gpuq submit` instead of
+invoking it directly.** Check `gpuq status` to see how many GPU slots are
+available on this host.
 
 ## When to use
 
@@ -37,6 +40,11 @@ gpuq cancel 42
 
 If you hit Ctrl-C or your session dies while waiting, the daemon automatically
 cancels your job (whether queued or running).
+
+The queue is persistent: queued jobs survive daemon restarts and reboots.
+A job that was queued when the daemon restarted will run detached (with no
+client attached) and its output goes to log files — retrieve with
+`gpuq logs <id>`. Running jobs do **not** survive a daemon crash.
 
 ## Priority
 
